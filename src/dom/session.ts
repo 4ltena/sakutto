@@ -207,11 +207,18 @@ export interface PageSelectionSnapshot {
   rect: DOMRect;
 }
 
+type PageSelection = PageSelectionSnapshot & { range: Range | null };
+
 /** Capture a document selection now; later awaits must not depend on it still existing. */
 export function capturePageSelection(
   doc: Document,
   isOwnUi: (node: Node) => boolean = () => false,
 ): PageSelectionSnapshot | null {
+  const selection = readPageSelection(doc, isOwnUi);
+  return selection && { text: selection.text, rect: selection.rect };
+}
+
+function readPageSelection(doc: Document, isOwnUi: (node: Node) => boolean): PageSelection | null {
   for (const current of collectDocuments(doc)) {
     const selection = current.getSelection?.() ?? current.defaultView?.getSelection() ?? null;
     if (!selection || selection.isCollapsed || selection.rangeCount === 0) continue;
@@ -227,7 +234,11 @@ export function capturePageSelection(
     } catch {
       continue;
     }
-    return { text, rect: selectionViewportRect(range, current, doc) };
+    return {
+      text,
+      rect: selectionViewportRect(range, current, doc),
+      range: selection.rangeCount === 1 ? range : null,
+    };
   }
   return null;
 }
@@ -784,13 +795,12 @@ export class PageSession {
     this.translateSelection(selected.text, selected.rect);
   }
 
-  private readSelection(): PageSelectionSnapshot | null {
-    return capturePageSelection(this.doc, (node) => this.overlay.contains(node));
+  private readSelection(): PageSelection | null {
+    return readPageSelection(this.doc, (node) => this.overlay.contains(node));
   }
 
   /**
-   * Inference starts when the highlight stops moving. The icon only reveals the
-   * popover, so a click does not wait to begin a request that is already running.
+   * Start inference when the highlight stops moving unless the selection is already translated.
    */
   private scheduleSelectionOffer(delayMs: number): void {
     if (this.selectionTimer !== null) clearTimeout(this.selectionTimer);
@@ -826,9 +836,15 @@ export class PageSession {
       this.overlay.moveSelection(selected.rect);
       return;
     }
-    if (this.selectionShown) this.dismissSelection();
+    const rendered = selected.range !== null && this.isRenderedRange(selected.range);
+    if (
+      this.selectionShown ||
+      (rendered && this.selection && this.selection.plainSource !== source)
+    ) {
+      this.dismissSelection();
+    }
     this.overlay.showSelectionIcon(selected.rect);
-    this.translateSelection(selected.text, selected.rect, false);
+    if (!rendered) this.translateSelection(selected.text, selected.rect, false);
   }
 
   private activateSelectionIcon(): void {
@@ -2189,6 +2205,41 @@ export class PageSession {
   private blockOf(node: Node): Element | null {
     const element = node instanceof Element ? node : node.parentElement;
     return element?.closest('[data-sakutto-id]') ?? null;
+  }
+
+  private isRenderedRange(range: Range): boolean {
+    const root = range.commonAncestorContainer;
+    if (root.nodeType === Node.TEXT_NODE) return this.isRenderedText(root as Text);
+
+    const walker = this.doc.createTreeWalker(root, NodeFilter.SHOW_ELEMENT | NodeFilter.SHOW_TEXT, {
+      acceptNode: (node) => {
+        if (!range.intersectsNode(node)) return NodeFilter.FILTER_REJECT;
+        return node.nodeType === Node.TEXT_NODE ? NodeFilter.FILTER_ACCEPT : NodeFilter.FILTER_SKIP;
+      },
+    });
+    let foundText = false;
+    for (let node = walker.nextNode(); node; node = walker.nextNode()) {
+      const text = node as Text;
+      const start = text === range.startContainer ? range.startOffset : 0;
+      const end = text === range.endContainer ? range.endOffset : text.length;
+      if (text.data.slice(start, end).trim() === '') continue;
+      if (!this.isRenderedText(text)) return false;
+      foundText = true;
+    }
+    return foundText;
+  }
+
+  private isRenderedText(text: Text): boolean {
+    const block = this.blockOf(text);
+    const item = block ? this.liveByBlock.get(block) : undefined;
+    if (!item || item.state !== 'done' || item.translation.trim() === '') return false;
+
+    if (this.prefs.display === 'bilingual' && this.keepsOriginalVisible(item)) {
+      const line = text.parentElement;
+      return line?.localName === 'sakutto-line' && line.parentElement === block;
+    }
+    // Only text nodes that the renderer touched are recorded, including inline slots.
+    return this.expected.get(text) === text.data;
   }
 
   private refreshBlock(block: Element): void {

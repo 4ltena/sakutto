@@ -2274,9 +2274,7 @@ describe('selection icon', () => {
     return button;
   }
 
-  async function selectElement(element: Element): Promise<void> {
-    const range = document.createRange();
-    range.selectNodeContents(element);
+  async function selectRange(range: Range): Promise<void> {
     const selection = document.getSelection();
     if (!selection) throw new Error('missing selection');
     selection.removeAllRanges();
@@ -2284,6 +2282,12 @@ describe('selection icon', () => {
     document.dispatchEvent(new Event('selectionchange'));
     document.dispatchEvent(new PointerEvent('pointerup', { bubbles: true }));
     await new Promise((resolve) => setTimeout(resolve, 30));
+  }
+
+  async function selectElement(node: Node): Promise<void> {
+    const range = document.createRange();
+    range.selectNodeContents(node);
+    await selectRange(range);
   }
 
   afterEach(() => {
@@ -2490,6 +2494,145 @@ describe('selection icon', () => {
     expect(uiShadow(popover())?.textContent).toContain('訳:Another phrase');
     expect(seen).toContain('Another phrase');
     expect(document.body.textContent).toContain('Another phrase');
+  });
+
+  describe('selection after page translation', () => {
+    function recordingEngine(requests: string[]): PageEngine {
+      return immediate((source) => {
+        requests.push(source);
+        return `訳:${source}`;
+      });
+    }
+
+    it.each(['icon', 'command'] as const)(
+      'defers translated text until the %s is used',
+      async (action) => {
+        document.documentElement.lang = 'en';
+        document.body.innerHTML = '<p id="lead">Osaka is a designated city.</p>';
+        const requests: string[] = [];
+        const session = start(document, recordingEngine(requests));
+        await session.translate();
+        await session.whenIdle();
+        const lead = document.querySelector('#lead');
+        if (!lead) throw new Error('missing paragraph');
+
+        await selectElement(lead);
+        await session.whenIdle();
+        expect(requests).toEqual(['Osaka is a designated city.']);
+        expect(icon().hidden).toBe(false);
+
+        if (action === 'icon') {
+          iconButton().dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+        } else {
+          await session.handle('selection');
+        }
+        await session.whenIdle();
+        expect(requests).toEqual(['Osaka is a designated city.', '訳:Osaka is a designated city.']);
+        expect(icon().hidden).toBe(true);
+      },
+    );
+
+    it('prefetches untranslated inline text inside a translated paragraph', async () => {
+      document.documentElement.lang = 'en';
+      document.body.innerHTML =
+        '<p id="lead">Osaka is a designated city. <span id="kept" translate="no">Kyoto is older.</span></p>';
+      const requests: string[] = [];
+      const session = start(document, recordingEngine(requests));
+      await session.translate();
+      await session.whenIdle();
+      expect(document.querySelector('#lead')?.textContent).toContain('訳:');
+      const kept = document.querySelector('#kept');
+      if (!kept) throw new Error('missing untranslated text');
+      const before = requests.length;
+
+      await selectElement(kept);
+      await session.whenIdle();
+      expect(requests.slice(before)).toEqual(['Kyoto is older.']);
+    });
+
+    it.each([false, true])(
+      'inspects the text between endpoints (untranslated block: %s)',
+      async (mixed) => {
+        document.documentElement.lang = 'en';
+        document.body.innerHTML = [
+          '<p id="first">Osaka is a designated city.</p>',
+          mixed ? '<p translate="no">Kyoto is older.</p>' : '',
+          '<p id="last">Kobe is a port city.</p>',
+        ].join('');
+        const requests: string[] = [];
+        const session = start(document, recordingEngine(requests));
+        await session.translate();
+        await session.whenIdle();
+        const first = document.querySelector('#first')?.firstChild;
+        const last = document.querySelector('#last')?.firstChild;
+        if (!first || !last) throw new Error('missing selection endpoints');
+        expect(first.textContent).toContain('訳:');
+        expect(last.textContent).toContain('訳:');
+        const range = document.createRange();
+        range.setStart(first, 0);
+        range.setEnd(last, last.textContent?.length ?? 0);
+        const before = requests.length;
+
+        await selectRange(range);
+        await session.whenIdle();
+        expect(icon().hidden).toBe(false);
+        expect(requests.slice(before)).toEqual(mixed ? [range.toString()] : []);
+      },
+    );
+
+    it('prefetches the original in bilingual mode and defers its translated line', async () => {
+      document.documentElement.lang = 'en';
+      document.body.innerHTML = '<p id="lead">Osaka is a designated city.</p>';
+      const requests: string[] = [];
+      const session = start(document, recordingEngine(requests), { display: 'bilingual' });
+      await session.translate();
+      await session.whenIdle();
+      const line = document.querySelector('sakutto-line');
+      const original = document.querySelector('#lead')?.firstChild;
+      if (!line || !original) throw new Error('missing bilingual text');
+
+      await selectElement(line);
+      await session.whenIdle();
+      expect(requests).toEqual(['Osaka is a designated city.']);
+
+      await selectElement(original);
+      await session.whenIdle();
+      expect(requests).toEqual(['Osaka is a designated city.', 'Osaka is a designated city.']);
+    });
+
+    it('prefetches the original while page translation is still running', async () => {
+      document.documentElement.lang = 'en';
+      document.body.innerHTML = '<p id="lead">Osaka is a designated city.</p>';
+      const requests: string[] = [];
+      const gate = Promise.withResolvers<void>();
+      const started = Promise.withResolvers<void>();
+      const session = start(
+        document,
+        engineOf(async function* (segments) {
+          for (const segment of segments) {
+            requests.push(segment.text);
+            if (requests.length === 1) {
+              started.resolve();
+              await gate.promise;
+            }
+            yield { id: segment.id, final: `訳:${segment.text}`, engine: 'plamo' };
+          }
+        }),
+      );
+      await session.translate();
+      await started.promise;
+      const lead = document.querySelector('#lead');
+      if (!lead) throw new Error('missing paragraph');
+
+      try {
+        await selectElement(lead);
+        expect(icon().hidden).toBe(false);
+      } finally {
+        gate.resolve();
+      }
+      await session.whenIdle();
+      expect(requests).toEqual(['Osaka is a designated city.', 'Osaka is a designated city.']);
+    });
   });
 });
 
