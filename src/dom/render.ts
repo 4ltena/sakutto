@@ -14,7 +14,7 @@ import {
   type TextSlot,
 } from './segment';
 
-const LINE_TAG = 'sakutto-line';
+export const LINE_TAG = 'sakutto-line';
 /**
  * Older builds painted a "quick translation" badge beside every Chrome draft. The badge
  * is gone, but a block translated by an older build can still hold one, so the cleanup

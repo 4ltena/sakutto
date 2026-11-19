@@ -2580,6 +2580,37 @@ describe('selection icon', () => {
       },
     );
 
+    it('bounds the scan for a full selection and still offers manual translation', async () => {
+      document.documentElement.lang = 'en';
+      document.body.innerHTML =
+        '<main><p>Osaka is a designated city.</p>' +
+        '<span></span>'.repeat(2048) +
+        '<p id="late" translate="no">Kyoto is older.</p></main>';
+      const requests: string[] = [];
+      const session = start(document, recordingEngine(requests));
+      await session.translate();
+      await session.whenIdle();
+      const page = document.querySelector('main');
+      const late = document.querySelector('#late')?.firstChild;
+      if (!page || !late) throw new Error('missing page content');
+      const before = requests.length;
+
+      const classifyLateText = vi.spyOn(late, 'parentElement', 'get');
+      try {
+        await selectElement(page);
+        await session.whenIdle();
+        expect(classifyLateText).not.toHaveBeenCalled();
+        expect(requests).toHaveLength(before);
+        expect(icon().hidden).toBe(false);
+      } finally {
+        classifyLateText.mockRestore();
+      }
+
+      await session.handle('selection');
+      await session.whenIdle();
+      expect(requests.slice(before)).toEqual([page.textContent]);
+    });
+
     it('prefetches the original in bilingual mode and defers its translated line', async () => {
       document.documentElement.lang = 'en';
       document.body.innerHTML = '<p id="lead">Osaka is a designated city.</p>';

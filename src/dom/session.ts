@@ -70,6 +70,7 @@ import {
 } from './priority';
 import {
   applyTranslation,
+  LINE_TAG,
   paintPlain,
   removeTranslationUi,
   restoreSegment,
@@ -100,6 +101,8 @@ const MAX_PAGE_FAILURES = 2;
 const SELECTION_SETTLE_MS = 48;
 /** A selectionchange that follows pointerup is the same gesture and should not wait out the keyboard delay. */
 const POINTER_RELEASE_WINDOW_MS = 80;
+/** Large selections can wait for an explicit translation instead of scanning the entire DOM. */
+const MAX_SELECTION_SCAN_NODES = 512;
 /**
  * Defensive deduplication for duplicate native command delivery. Toggle would otherwise
  * translate and immediately restore, which looks like the shortcut doing nothing.
@@ -836,15 +839,15 @@ export class PageSession {
       this.overlay.moveSelection(selected.rect);
       return;
     }
-    const rendered = selected.range !== null && this.isRenderedRange(selected.range);
+    const prefetch = selected.range === null || this.shouldPrefetchRange(selected.range);
     if (
       this.selectionShown ||
-      (rendered && this.selection && this.selection.plainSource !== source)
+      (!prefetch && this.selection && this.selection.plainSource !== source)
     ) {
       this.dismissSelection();
     }
     this.overlay.showSelectionIcon(selected.rect);
-    if (!rendered) this.translateSelection(selected.text, selected.rect, false);
+    if (prefetch) this.translateSelection(selected.text, selected.rect, false);
   }
 
   private activateSelectionIcon(): void {
@@ -1798,7 +1801,7 @@ export class PageSession {
 
       if (bilingual) {
         showBilingual(model, text, item.created);
-        const line = model.block.querySelector('sakutto-line');
+        const line = model.block.querySelector(LINE_TAG);
         if (line instanceof HTMLElement) line.lang = this.prefs.targetLanguage;
         if (!partial || !model.placeholder) model.block.removeAttribute('data-sakutto-pending');
       } else if (partial) {
@@ -2207,26 +2210,34 @@ export class PageSession {
     return element?.closest('[data-sakutto-id]') ?? null;
   }
 
-  private isRenderedRange(range: Range): boolean {
+  private shouldPrefetchRange(range: Range): boolean {
     const root = range.commonAncestorContainer;
-    if (root.nodeType === Node.TEXT_NODE) return this.isRenderedText(root as Text);
+    if (root.nodeType === Node.TEXT_NODE) return !this.isRenderedText(root as Text);
 
-    const walker = this.doc.createTreeWalker(root, NodeFilter.SHOW_ELEMENT | NodeFilter.SHOW_TEXT, {
-      acceptNode: (node) => {
-        if (!range.intersectsNode(node)) return NodeFilter.FILTER_REJECT;
-        return node.nodeType === Node.TEXT_NODE ? NodeFilter.FILTER_ACCEPT : NodeFilter.FILTER_SKIP;
-      },
-    });
+    const { startContainer, startOffset, endContainer, endOffset } = range;
+    const first =
+      startContainer.nodeType === Node.TEXT_NODE
+        ? startContainer
+        : (startContainer.childNodes[startOffset] ?? nextAfterSubtree(startContainer, root));
+    const after = endContainer.childNodes[endOffset] ?? nextAfterSubtree(endContainer, root);
+
+    let inspected = 0;
     let foundText = false;
-    for (let node = walker.nextNode(); node; node = walker.nextNode()) {
+    for (
+      let node = first;
+      node && node !== after;
+      node = node.firstChild ?? nextAfterSubtree(node, root)
+    ) {
+      if (++inspected > MAX_SELECTION_SCAN_NODES) return false;
+      if (node.nodeType !== Node.TEXT_NODE) continue;
       const text = node as Text;
-      const start = text === range.startContainer ? range.startOffset : 0;
-      const end = text === range.endContainer ? range.endOffset : text.length;
+      const start = text === startContainer ? startOffset : 0;
+      const end = text === endContainer ? endOffset : text.length;
       if (text.data.slice(start, end).trim() === '') continue;
-      if (!this.isRenderedText(text)) return false;
+      if (!this.isRenderedText(text)) return true;
       foundText = true;
     }
-    return foundText;
+    return !foundText;
   }
 
   private isRenderedText(text: Text): boolean {
@@ -2236,7 +2247,7 @@ export class PageSession {
 
     if (this.prefs.display === 'bilingual' && this.keepsOriginalVisible(item)) {
       const line = text.parentElement;
-      return line?.localName === 'sakutto-line' && line.parentElement === block;
+      return line?.localName === LINE_TAG && line.parentElement === block;
     }
     // Only text nodes that the renderer touched are recorded, including inline slots.
     return this.expected.get(text) === text.data;
@@ -2512,6 +2523,14 @@ export class PageSession {
     const waiters = this.idleWaiters.splice(0);
     for (const resolve of waiters) resolve();
   }
+}
+
+/** The next node in document order after all descendants, within the range's root. */
+function nextAfterSubtree(node: Node, root: Node): Node | null {
+  for (let current: Node | null = node; current && current !== root; current = current.parentNode) {
+    if (current.nextSibling) return current.nextSibling;
+  }
+  return null;
 }
 
 function isBodyCopy(block: Element): boolean {

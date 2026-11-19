@@ -12,7 +12,7 @@ import { listTranslatableBlocks } from './blocks';
 import { canonicalPageLanguage, inferLanguage, isAlreadyTargetLanguage } from './detect';
 import { translationPriority } from './priority';
 import { assessTranslation, stripPlaceholderTokens } from './placeholders';
-import { applyTranslation, restoreSegment } from './render';
+import { applyTranslation, LINE_TAG, restoreSegment } from './render';
 import {
   MAIL_BANNER_PRESS_EVENTS,
   isMailBannerPressTrigger,
@@ -2832,7 +2832,7 @@ function isPageTranslated(body: Element): boolean {
   return (
     body.hasAttribute('data-sakutto-id') ||
     body.querySelector('[data-sakutto-id]') !== null ||
-    body.querySelector('sakutto-line') !== null
+    body.querySelector(LINE_TAG) !== null
   );
 }
 
